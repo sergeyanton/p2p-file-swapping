@@ -46,22 +46,7 @@ pub enum BarterNegotiationResponse {
     Decline,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DiscoveryRequest {
-    Register {
-        username: String,
-        addrs: Vec<String>,
-    },
-    GetPeers,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DiscoveryResponse {
-    Registered,
-    Peers { peers: Vec<PeerInfo> },
-    Error(String),
-}
-
+// PeerInfo struct for tracking peer information
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub peer_id: String,
@@ -77,7 +62,6 @@ pub struct ChatBehaviour {
     pub identify: identify::Behaviour,
     pub rendezvous: rendezvous::client::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
-    pub discovery_protocol: request_response::cbor::Behaviour<DiscoveryRequest, DiscoveryResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -174,13 +158,6 @@ impl ChatRoom {
             .with_request_timeout(Duration::from_secs(30))
             .with_max_concurrent_streams(100);
 
-        // Configure request-response for discovery protocol
-        let discovery_protocols = vec![(
-            StreamProtocol::new("/discovery/1.0.0"),
-            ProtocolSupport::Full,
-        )];
-        let discovery_config = RpConfig::default().with_request_timeout(Duration::from_secs(10));
-
         // Build the swarm
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(id_keys.clone())
             .with_tokio()
@@ -201,10 +178,6 @@ impl ChatRoom {
                 let barter_protocol =
                     request_response::cbor::Behaviour::new(barter_protocols, barter_config);
 
-                // Set up discovery protocol
-                let discovery_protocol =
-                    request_response::cbor::Behaviour::new(discovery_protocols, discovery_config);
-
                 // Set up identity protocol
                 let identify = identify::Behaviour::new(identify::Config::new(
                     "/p2p-file-barter/1.0.0".to_string(),
@@ -223,7 +196,6 @@ impl ChatRoom {
                 ChatBehaviour {
                     gossipsub,
                     barter_protocol,
-                    discovery_protocol,
                     identify,
                     rendezvous,
                     kad,
@@ -301,47 +273,162 @@ impl ChatRoom {
         if let Some(server_id) = self.rendezvous_server {
             println!("🔄 Registering with rendezvous server: {}", server_id);
 
-            // Print all listening addresses before registration
-            println!("🔍 [DEBUG] Client listening addresses before registration:");
-            for addr in self.swarm.listeners() {
-                println!("    {}", addr);
-            }
-
             // Create a namespace for the chat room
             if let Ok(namespace) = rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_string()) {
-                // Register with the rendezvous server
-                let result = self.swarm.behaviour_mut().rendezvous.register(
-                    namespace.clone(),
-                    server_id,
-                    None,
-                );
+                // Make sure we have external addresses before registration
+                // External addresses are essential for other peers to connect to us
+                if self.swarm.listeners().count() == 0 {
+                    println!("⚠️ No listening addresses available for registration");
+                    return Err("No listening addresses available".into());
+                }
 
-                match &result {
-                    Ok(()) => println!("✅ Registered with rendezvous server"),
-                    Err(e) => {
-                        println!("⚠️ Failed to register with rendezvous server: {}", e);
-                        // Optionally, print more debug info here
+                // First collect all listener addresses into a Vec
+                // This avoids the borrowing conflict
+                let listen_addrs: Vec<_> = self.swarm.listeners().cloned().collect();
+
+                // Clear any existing external addresses to avoid duplicates
+                let external_addrs: Vec<_> = self.swarm.external_addresses().cloned().collect();
+                for addr in external_addrs {
+                    self.swarm.remove_external_address(&addr);
+                }
+
+                println!("🔍 Adding external addresses for registration:");
+
+                // First add all listener addresses as external addresses
+                for addr in &listen_addrs {
+                    // Skip loopback addresses as they're not useful for external connections
+                    if !addr.to_string().contains("/ip4/127.0.0.1/") {
+                        self.swarm.add_external_address(addr.clone());
+                        println!("    ✅ Adding listener address: {}", addr);
+                    } else {
+                        println!("    ❌ Skipping loopback address: {}", addr);
                     }
                 }
 
-                // Print the addresses again after registration attempt
-                println!("🔍 [DEBUG] Client listening addresses after registration attempt:");
-                for addr in self.swarm.listeners() {
-                    println!("    {}", addr);
+                // Get the local IP address and add it as external address
+                if let Ok(ip) = local_ip_address::local_ip() {
+                    println!("🌐 Detected local network IP: {}", ip);
+
+                    // Add external addresses with the real IP for all listening ports
+                    for addr in &listen_addrs {
+                        if let Some(port) = extract_port_from_multiaddr(addr) {
+                            // Only add if it's not a loopback address
+                            if !ip.is_loopback() {
+                                let external_addr: Multiaddr =
+                                    format!("/ip4/{}/tcp/{}", ip, port).parse()?;
+                                self.swarm.add_external_address(external_addr.clone());
+                                println!(
+                                    "    ✅ Adding explicit external address: {}",
+                                    external_addr
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    println!("⚠️ Could not detect local IP address");
                 }
 
-                // Start peer discovery
-                self.swarm.behaviour_mut().rendezvous.discover(
-                    Some(namespace),
-                    None,
-                    None,
-                    server_id,
+                // Print all external addresses for debugging
+                let external_addr_count = self.swarm.external_addresses().count();
+                println!(
+                    "🔍 [DEBUG] External addresses for registration ({}): ",
+                    external_addr_count
                 );
+                for addr in self.swarm.external_addresses() {
+                    println!("    {}", addr.clone());
+                }
 
-                println!("🔍 Discovering peers via rendezvous server");
+                if external_addr_count == 0 {
+                    println!("❌ ERROR: No external addresses available for registration!");
+                    println!("   The rendezvous server requires external addresses to register.");
+                    println!("   This may be due to network configuration issues.");
+                    return Err("No external addresses available for registration".into());
+                }
+
+                // Check if we're connected to the rendezvous server
+                let mut connected_to_server = false;
+
+                // Check if we're already connected to the server
+                for peer_id in self.swarm.connected_peers() {
+                    if *peer_id == server_id {
+                        connected_to_server = true;
+                        println!("✅ Already connected to rendezvous server: {}", server_id);
+                        break;
+                    }
+                }
+
+                // If not connected yet, try to connect and wait
+                if !connected_to_server {
+                    println!("🔄 Connecting to rendezvous server: {}", server_id);
+
+                    // Try dialing with multiaddr format: /p2p/{peer_id}
+                    let p2p_addr = format!("/p2p/{}", server_id).parse::<Multiaddr>()?;
+                    match self.swarm.dial(p2p_addr) {
+                        Ok(_) => println!("🔄 Dial request sent to rendezvous server"),
+                        Err(e) => println!("⚠️ Failed to dial rendezvous server: {}", e),
+                    }
+
+                    // Wait for connection to establish
+                    println!("⏳ Waiting for connection to establish...");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+
+                    // Check again if we're connected
+                    for peer_id in self.swarm.connected_peers() {
+                        if *peer_id == server_id {
+                            connected_to_server = true;
+                            println!(
+                                "✅ Connection established to rendezvous server: {}",
+                                server_id
+                            );
+                            break;
+                        }
+                    }
+
+                    if !connected_to_server {
+                        println!(
+                            "⚠️ Not connected to rendezvous server yet. Will attempt registration anyway."
+                        );
+                    }
+                }
+
+                // Register with the rendezvous server
+                match self.swarm.behaviour_mut().rendezvous.register(
+                    namespace.clone(),
+                    server_id,
+                    Some(libp2p::rendezvous::DEFAULT_TTL), // Use the default TTL (2 hours)
+                ) {
+                    Ok(()) => {
+                        println!("📤 Registration request sent to rendezvous server");
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to register with rendezvous server: {}", e);
+
+                        // Show detailed error information
+                        if e.to_string().contains("no external addresses") {
+                            println!(
+                                "   This error indicates that the client has no valid external addresses."
+                            );
+                            println!(
+                                "   Make sure your network allows incoming connections and your"
+                            );
+                            println!("   external addresses are properly configured.");
+
+                            // Print current external addresses to help diagnose
+                            println!("\n   Current external addresses:");
+                            for addr in self.swarm.external_addresses() {
+                                println!("      {}", addr);
+                            }
+                        }
+
+                        return Err(format!("Registration request failed: {}", e).into());
+                    }
+                }
             } else {
                 println!("⚠️ Failed to create namespace for rendezvous");
+                return Err("Invalid namespace".into());
             }
+        } else {
+            return Err("No rendezvous server specified".into());
         }
 
         Ok(())
@@ -437,17 +524,28 @@ impl ChatRoom {
             if let Ok(namespace) = rendezvous::Namespace::new(RENDEZVOUS_NAMESPACE.to_string()) {
                 println!("🔍 Discovering peers via rendezvous server: {}", server_id);
 
+                // Store the current time to track when discovery was last initiated
+                self.last_discovery_time = Some(std::time::Instant::now());
+
+                // Use cookie for efficient discovery if we have one (gets only updates since last discovery)
+                // This significantly reduces network traffic and server load
+                let cookie = None; // For a more advanced implementation, store and reuse cookies
+                let limit = Some(50); // Reasonable limit to avoid overwhelming the network
+
                 self.swarm.behaviour_mut().rendezvous.discover(
                     Some(namespace),
-                    None,
-                    None,
+                    cookie,
+                    limit,
                     server_id,
                 );
 
                 println!("🔍 Started peer discovery via rendezvous");
             } else {
                 println!("⚠️ Failed to create namespace for rendezvous");
+                return Err("Invalid namespace".into());
             }
+        } else {
+            return Err("No rendezvous server specified".into());
         }
 
         Ok(())
@@ -473,6 +571,9 @@ impl ChatRoom {
         // Track if registration has been attempted
         let mut registration_attempted = false;
 
+        // Track active connections to the rendezvous server
+        let mut connected_to_rendezvous = false;
+
         println!("\n===== P2P Chat Room =====\n");
         println!("Commands:");
         println!("  /help - Show available commands");
@@ -487,9 +588,9 @@ impl ChatRoom {
             let now = std::time::Instant::now();
 
             // If we're listening but not registered with rendezvous server, attempt registration
-            if listening {
-                // Register with rendezvous server if available and not yet registered
-                if !rendezvous_registered && self.rendezvous_server.is_some() {
+            if listening && !rendezvous_registered && self.rendezvous_server.is_some() {
+                if !connected_to_rendezvous {
+                    // Only try to connect if not already connected
                     if let Some(server_id) = self.rendezvous_server {
                         // Try to dial the rendezvous server if not already connected
                         match self
@@ -499,16 +600,18 @@ impl ChatRoom {
                             Ok(_) => println!("🔄 Connecting to rendezvous server: {}", server_id),
                             Err(e) => println!("⚠️ Failed to dial rendezvous server: {}", e),
                         }
-
-                        // Wait a moment for the connection to establish
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
-
+                    }
+                } else if !registration_attempted {
+                    // Only try to register if we have a connection but haven't tried registration yet
+                    registration_attempted = true;
+                    if let Some(server_id) = self.rendezvous_server {
                         // Register with the native libp2p rendezvous protocol
                         if let Err(e) = self.register_with_rendezvous().await {
                             println!("⚠️ Failed to register with rendezvous server: {}", e);
                         } else {
-                            rendezvous_registered = true;
-                            println!("✅ Successfully registered with rendezvous server");
+                            println!(
+                                "✅ Registration request sent to rendezvous server (awaiting confirmation)"
+                            );
                         }
                     }
                 }
@@ -648,46 +751,33 @@ impl ChatRoom {
                     SwarmEvent::NewListenAddr { address, .. } => {
                         println!("\n📡  Listening on {:?}\n", address);
                         listening = true;  // Mark that we have at least one listening address
-                        if !registration_attempted {
-                            registration_attempted = true;
-                            // Wait 2 seconds to allow all addresses to be discovered
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            // Print all addresses before registration
-                            println!("[DEBUG] All client listening addresses before registration:");
-                            for addr in self.swarm.listeners() {
-                                println!("    {}", addr);
-                            }
-                            // Register with rendezvous server if available and not yet registered
-                            if !rendezvous_registered && self.rendezvous_server.is_some() {
-                                if let Some(server_id) = self.rendezvous_server {
-                                    // Try to dial the rendezvous server if not already connected
-                                    match self
-                                        .swarm
-                                        .dial(format!("/p2p/{}", server_id).parse::<Multiaddr>()?)
-                                    {
-                                        Ok(_) => println!("🔄 Connecting to rendezvous server: {}", server_id),
-                                        Err(e) => println!("⚠️ Failed to dial rendezvous server: {}", e),
-                                    }
-
-                                    // Wait a moment for the connection to establish
-                                    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-                                    // Register with the native libp2p rendezvous protocol
-                                    if let Err(e) = self.register_with_rendezvous().await {
-                                        println!("⚠️ Failed to register with rendezvous server: {}", e);
-                                    } else {
-                                        rendezvous_registered = true;
-                                        println!("✅ Successfully registered with rendezvous server");
-                                    }
-                                }
-                            }
-                        }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         println!("\n🔗  Connection established to {:?}\n", peer_id);
                         let _ = self.announce_presence().await;
                         if !self.connected_peers.contains_key(&peer_id) {
                             self.connected_peers.insert(peer_id, "Connected (awaiting username)".to_string());
+                        }
+
+                        // Check if this is a connection to our rendezvous server
+                        if let Some(server_id) = self.rendezvous_server {
+                            if peer_id == server_id {
+                                connected_to_rendezvous = true;
+                                println!("✅ Connected to rendezvous server: {}", server_id);
+
+                                // Wait a moment before registration to ensure the connection is fully ready
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                                // Now register with the server
+                                if !registration_attempted {
+                                    registration_attempted = true;
+                                    if let Err(e) = self.register_with_rendezvous().await {
+                                        println!("⚠️ Failed to register with rendezvous server: {}", e);
+                                    } else {
+                                        println!("✅ Registration request sent to rendezvous server (awaiting confirmation)");
+                                    }
+                                }
+                            }
                         }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -696,10 +786,19 @@ impl ChatRoom {
                         } else {
                             println!("\n❌  Connection closed with {:?}\n", peer_id);
                         }
+
+                        // Check if this is our rendezvous server
+                        if let Some(server_id) = self.rendezvous_server {
+                            if peer_id == server_id {
+                                connected_to_rendezvous = false;
+                                rendezvous_registered = false;
+                                println!("❌ Disconnected from rendezvous server: {}", server_id);
+                            }
+                        }
                     }
                     SwarmEvent::Behaviour(ChatBehaviourEvent::Rendezvous(event)) => match event {
-                        rendezvous::client::Event::Discovered { registrations, .. } => {
-                            println!("\n🔍 Discovered {} peers via rendezvous", registrations.len());
+                        rendezvous::client::Event::Discovered { rendezvous_node, registrations, cookie } => {
+                            println!("\n🔍 Discovered {} peers via rendezvous server {}", registrations.len(), rendezvous_node);
 
                             for registration in registrations {
                                 // Skip ourselves
@@ -707,7 +806,10 @@ impl ChatRoom {
                                     continue;
                                 }
 
-                                println!("   - Found peer: {}", registration.record.peer_id());
+                                println!("   - Found peer: {} in namespace {}",
+                                    registration.record.peer_id(),
+                                    registration.namespace);
+                                println!("   - TTL: {} seconds", registration.ttl);
 
                                 // Check if we already have this peer in our connected peers
                                 if !self.connected_peers.contains_key(&registration.record.peer_id()) {
@@ -738,70 +840,82 @@ impl ChatRoom {
                                 }
                             }
                         },
-                        rendezvous::client::Event::DiscoverFailed { error, .. } => {
-                            println!("\n⚠️ Discovery failed: {:?}\n", error);
-                        },
-                        _ => {}  // Handle other rendezvous events if needed
-                    },
-                    SwarmEvent::Behaviour(ChatBehaviourEvent::DiscoveryProtocol(e)) => match e {
-                        request_response::Event::Message { peer, message, .. } => {
-                            match message {
-                                request_response::Message::Response { response, .. } => {
-                                    match response {
-                                        DiscoveryResponse::Registered => {
-                                            println!("\n✅  Successfully registered with discovery server\n");
-                                        },
-                                        DiscoveryResponse::Peers { peers } => {
-                                            println!("\n🔍  Received list of {} peers from discovery server", peers.len());
+                        rendezvous::client::Event::DiscoverFailed { rendezvous_node, namespace, error } => {
+                            println!("\n⚠️ Discovery failed from server {}: {:?}", rendezvous_node, error);
+                            println!("   Namespace: {:?}", namespace);
 
-                                            for peer_info in peers {
-                                                // Skip ourselves
-                                                if peer_info.peer_id == self.swarm.local_peer_id().to_string() {
-                                                    continue;
-                                                }
-
-                                                println!("   - Found peer: {} ({})", peer_info.username, peer_info.peer_id);
-
-                                                // Parse the peer ID
-                                                if let Ok(peer_id) = peer_info.peer_id.parse::<PeerId>() {
-                                                    // Parse the addresses
-                                                    let mut addrs = Vec::new();
-                                                    for addr_str in &peer_info.addrs {
-                                                        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
-                                                            addrs.push(addr);
-                                                        }
-                                                    }
-
-                                                    // Store the peer and its addresses
-                                                    self.discovered_peers.insert(peer_id, addrs.clone());
-
-                                                    // Try to connect if we're not already connected
-                                                    if !self.connected_peers.contains_key(&peer_id) {
-                                                        for addr in addrs {
-                                                            match self.swarm.dial(addr.clone()) {
-                                                                Ok(_) => {
-                                                                    println!("   - Dialing peer {} at {}", peer_id, addr);
-                                                                    break; // Just try one address
-                                                                },
-                                                                Err(e) => {
-                                                                    println!("   - Failed to dial {}: {}", addr, e);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            println!();
-                                        },
-                                        DiscoveryResponse::Error(msg) => {
-                                            println!("\n⚠️  Error from discovery server: {}\n", msg);
-                                        }
-                                    }
-                                },
-                                _ => {}
+                            // Implement retry logic for transient errors
+                            if let rendezvous::ErrorCode::Unavailable = error {
+                                println!("   Server may be temporarily unavailable. Will retry later.");
                             }
                         },
-                        _ => {}
+                        rendezvous::client::Event::Registered { rendezvous_node, ttl, namespace } => {
+                            rendezvous_registered = true;
+                            println!("\n✅ Successfully registered with rendezvous server {}", rendezvous_node);
+                            println!("   Namespace: {}", namespace);
+                            println!("   Registration valid for {} seconds", ttl);
+
+                            // Registration was successful, now we can start discovery
+                            self.swarm.behaviour_mut().rendezvous.discover(
+                                Some(namespace.clone()),
+                                None,
+                                Some(50),
+                                rendezvous_node,
+                            );
+                            println!("🔍 Starting peer discovery after successful registration");
+                            last_discovery = std::time::Instant::now();
+                        },
+                        rendezvous::client::Event::RegisterFailed { rendezvous_node, namespace, error } => {
+                            println!("\n❌ Registration failed with rendezvous server {}: {:?}", rendezvous_node, error);
+                            println!("   Namespace: {}", namespace);
+
+                            // Reset registration flag to allow retries
+                            registration_attempted = false;
+
+                            match error {
+                                rendezvous::ErrorCode::InvalidNamespace => {
+                                    println!("   The namespace is invalid. Please check your namespace configuration.");
+                                },
+                                rendezvous::ErrorCode::InvalidTtl => {
+                                    println!("   The TTL is invalid. Using a value between {} and {} seconds.",
+                                        rendezvous::MIN_TTL, rendezvous::MAX_TTL);
+                                },
+                                rendezvous::ErrorCode::NotAuthorized => {
+                                    println!("   Not authorized. The server may require authentication.");
+                                },
+                                rendezvous::ErrorCode::Unavailable => {
+                                    println!("   Server is temporarily unavailable. Will retry in 5 seconds.");
+                                    // Schedule a retry after a delay
+                                    // tokio::spawn({
+                                    //     let rendezvous_server = self.rendezvous_server;
+                                    //     let mut this = self.clone();
+                                    //     async move {
+                                    //         tokio::time::sleep(Duration::from_secs(5)).await;
+                                    //         if let Some(server_id) = rendezvous_server {
+                                    //             if let Err(e) = this.register_with_rendezvous().await {
+                                    //                 println!("⚠️ Retry registration failed: {}", e);
+                                    //             }
+                                    //         }
+                                    //     }
+                                    // });
+                                },
+                                _ => {
+                                    println!("   Unknown error occurred during registration.");
+                                }
+                            }
+                        },
+                        rendezvous::client::Event::Expired { peer } => {
+                            // A peer's registration has expired
+                            println!("\n⏱️ Registration for peer {} has expired", peer);
+
+                            // Remove from our discovered peers map
+                            self.discovered_peers.remove(&peer);
+
+                            // If we were connected, we might want to check if they're still reachable
+                            if self.connected_peers.contains_key(&peer) {
+                                println!("   This peer was in our connected peers list. Connection may still be active.");
+                            }
+                        },
                     },
                     SwarmEvent::Behaviour(ChatBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source: _source,
@@ -829,7 +943,7 @@ impl ChatRoom {
 
                                     match action {
                                         PresenceAction::Join | PresenceAction::Leave => {
-                                            // Hybrid apporach for discovery, better safe than sorry. Discover when someone leaves/joins AND every 5 minutes
+                                            // Hybrid approach for discovery, better safe than sorry. Discover when someone leaves/joins AND every 5 minutes
                                             if now.duration_since(last_discovery) > MIN_DISCOVERY_INTERVAL {
                                                 let _ = self.discover_peers().await;
                                                 last_discovery = now;
@@ -963,3 +1077,16 @@ impl ChatRoom {
 // Need to import this for message ID generation
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+// Utility function to extract port from multiaddr
+fn extract_port_from_multiaddr(addr: &Multiaddr) -> Option<u16> {
+    use libp2p::multiaddr::Protocol;
+
+    for proto in addr.iter() {
+        if let Protocol::Tcp(port) = proto {
+            return Some(port);
+        }
+    }
+
+    None
+}
