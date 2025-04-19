@@ -1046,18 +1046,20 @@ impl ChatRoom {
                                     // Don't send the response now
                                 }
                             },
-                            Message::Response { request_id: _, response } => match response {
+                            Message::Response { response, .. } => match response {
                                 BarterNegotiationResponse::Accept { addrs } => {
                                     println!("\n✅  Barter request accepted!");
-                                    println!("[DEBUG] Received barter addresses: {:?}", addrs);
+                                    println!("🔄 Press Enter to join the barter session...");
 
-                                    // Join the addresses into a comma-separated string
-                                    let addr_str = addrs.join(",");
+                                    // Wait for the user to press Enter before transitioning
+                                    if let Ok(Some(_)) = stdin.next_line().await {
+                                        println!("🔄 Entering barter session...");
+                                    }
 
-                                    // Return AcceptBarter with peer_id and addresses
+                                    // Return to transition to barter mode
                                     return Ok(ChatRoomExit::AcceptBarter {
                                         peer_id: peer.to_string(),
-                                        addr: Some(addr_str)
+                                        addr: Some(addrs.join(","))
                                     });
                                 },
                                 BarterNegotiationResponse::Decline => {
